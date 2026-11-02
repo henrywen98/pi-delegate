@@ -11,12 +11,39 @@ const source = await readFile(new URL("../skills/delegate/dispatch.js", import.m
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const runTemplate = new AsyncFunction("jobs", "tools", "text", source);
 
-async function fixture(t) {
+async function fixture(t, {managed = false} = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "pi-delegate-test-"));
   const bin = path.join(root, "bin");
   const cwd = path.join(root, "project's files");
   await mkdir(bin);
   await mkdir(cwd);
+  const sdk = path.join(root, managed ? "install/releases/test/node_modules" : "node_modules", "@earendil-works/pi-coding-agent");
+  await mkdir(sdk, {recursive: true});
+  await writeFile(path.join(sdk, "package.json"), JSON.stringify({type: "module", exports: "./index.js"}));
+  const fakeRuntime = `export class ModelRuntime {
+    static async create(options) {
+      if (options.allowModelNetwork !== false) throw new Error('Network must be disabled');
+      return new ModelRuntime();
+    }
+    getModel(provider, id) {
+      if (provider === 'missing-method') this.isUsingSubscription = undefined;
+      this.model = {provider, id};
+      return id === 'missing' ? undefined : this.model;
+    }
+    getAvailableSnapshot() { return this.model.provider === 'unavailable' ? [] : [this.model]; }
+    isUsingSubscription(provider) {
+      if (provider === 'check-error') throw new Error('Cannot inspect auth');
+      if (provider === 'unknown-state') return undefined;
+      if (provider === 'truthy-state') return 'true';
+      return ['example', 'second-subscription', 'unavailable'].includes(provider);
+    }
+  }`;
+  await writeFile(path.join(sdk, "index.js"), fakeRuntime);
+  if (managed) {
+    await mkdir(path.join(sdk, "dist"));
+    await writeFile(path.join(sdk, "dist/index.js"), fakeRuntime);
+    await writeFile(path.join(root, "install/current-version"), "test\n");
+  }
   await writeFile(path.join(bin, "pi"), `#!/usr/bin/env node
 const fs = require('node:fs');
 const path = require('node:path');
@@ -80,7 +107,7 @@ if (prompt === 'FAIL') {
     await Promise.all([...directories, root].map(dir => rm(dir, {recursive: true, force: true})));
   });
   return {
-    cwd, tools, calls,
+    cwd, tools, calls, sdk,
     get peakWorkers() { return peakWorkers; },
     job: (task, extra = {}) => ({cwd, model: "example/model:low", task, ...extra}),
     async run(jobs, overrides = {}) {
@@ -97,7 +124,9 @@ test("package exposes only the delegate skill", async () => {
   const skill = await readFile(new URL("../skills/delegate/SKILL.md", import.meta.url), "utf8");
   assert.match(skill, /^---\nname: delegate\ndescription: .+\n/);
   assert.match(skill, /Read `dispatch\.js`/);
-  assert.doesNotMatch(source, /\b(import|require)\s*\(/);
+  // Imports belong to the embedded Node preflight, not the codemode VM.
+  assert.match(source, /node --input-type=module/);
+  assert.match(source, /isUsingSubscription\(provider\) !== true/);
 });
 
 test("a fresh worker receives exact input and returns only artifact paths", async t => {
@@ -118,7 +147,48 @@ test("a fresh worker receives exact input and returns only artifact paths", asyn
   assert.ok(args.includes("--print"));
   assert.ok(!args.includes("--continue"));
   assert.match(args[args.indexOf("--append-system-prompt") + 1], /leaf worker/);
-  assert.equal(f.calls.at(-1).timeout, 630);
+  assert.equal(f.calls.at(-1).timeout, 665);
+});
+
+test("subscription checks accept another provider without a name allowlist", async t => {
+  const f = await fixture(t);
+  const [result] = await f.run([f.job("OK", {model: "second-subscription/model:medium"})]);
+  assert.equal(result.status, "completed");
+});
+
+test("managed Pi installations resolve the subscription SDK", async t => {
+  const f = await fixture(t, {managed: true});
+  const [result] = await f.run([f.job("OK")]);
+  assert.equal(result.status, "completed");
+});
+
+test("unconfirmed subscription access never launches a worker", async t => {
+  const f = await fixture(t);
+  for (const model of ["api-key/model", "oauth-only/model", "unknown-state/model",
+    "truthy-state/model", "missing-method/model", "check-error/model",
+    "unavailable/model", "example/missing"]) {
+    const [result] = await f.run([f.job("OK", {model})]);
+    assert.equal(result.status, "failed", model);
+    assert.equal(result.exitCode, 78, model);
+    assert.equal(await readFile(result.result, "utf8"), "");
+    assert.match(await readFile(result.stderr, "utf8"), /Subscription check failed/);
+    await assert.rejects(access(path.join(path.dirname(result.task), "args.json")));
+  }
+});
+
+test("missing SDK fails closed without invoking Pi", async t => {
+  const f = await fixture(t);
+  await rm(f.sdk, {recursive: true});
+  const [result] = await f.run([f.job("OK")]);
+  assert.equal(result.exitCode, 78);
+  await assert.rejects(access(path.join(path.dirname(result.task), "args.json")));
+});
+
+test("a blocked worker does not prevent an approved subscription worker", async t => {
+  const f = await fixture(t);
+  const results = await f.run([f.job("OK", {model: "api-key/model"}), f.job("OK")]);
+  assert.deepEqual(results.map(r => r.status), ["failed", "completed"]);
+  assert.deepEqual(results.map(r => r.exitCode), [78, 0]);
 });
 
 test("two workers run concurrently and one failure does not hide the other", async t => {

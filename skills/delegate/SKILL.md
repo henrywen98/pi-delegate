@@ -52,7 +52,11 @@ const jobs = [{
 // Paste dispatch.js here.
 ```
 
-Use an available, authenticated model. Specify the provider and model explicitly; include a supported thinking suffix when needed. Use the current model when its full identity is known. Otherwise inspect Pi configuration or available models instead of guessing.
+Use an exact, available model with Pi-confirmed subscription access. Specify its provider and model ID; add a supported thinking suffix when needed. Prefer the current model only when it passes this check.
+
+Keep the template's subscription check intact. It requires `ModelRuntime.isUsingSubscription(providerId) === true` under the worker's configured credentials. OAuth alone, provider names, and catalog prices are insufficient. A missing method, unknown model, or failed check stops that worker before launch. Report the failure; do not remove the check or fall back to another billing channel.
+
+This check identifies subscription access, not free usage or remaining quota. API-key plans without Pi's subscription marker remain blocked. The check reads standard Pi configuration; extension-only providers cannot pass unless that runtime already knows them. See [Boundaries](../../README.md#boundaries) for the preflight limits.
 
 Choose a working directory whose context files apply to the task. Workers use normal Pi resource discovery and credentials. They do not inherit the parent's conversation, active model selection, or temporary tool state. Parent-only tools might be unavailable in a child.
 
